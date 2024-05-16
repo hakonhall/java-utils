@@ -3,217 +3,316 @@ package no.ion.utils.io;
 import javax.annotation.concurrent.Immutable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.FileSystem;
+import java.nio.charset.UnmappableCharacterException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.NotDirectoryException;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.nio.file.attribute.BasicFileAttributeView;
-import java.nio.file.attribute.BasicFileAttributes;
-import java.nio.file.attribute.FileAttribute;
-import java.nio.file.attribute.FileOwnerAttributeView;
-import java.nio.file.attribute.FileTime;
-import java.nio.file.attribute.GroupPrincipal;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFileAttributes;
-import java.nio.file.attribute.PosixFilePermission;
-import java.nio.file.attribute.UserPrincipal;
-import java.nio.file.attribute.UserPrincipalLookupService;
-import java.nio.file.attribute.UserPrincipalNotFoundException;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
-import java.util.function.Predicate;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static java.util.Objects.requireNonNull;
-import static no.ion.utils.exceptions.Exceptions.probe;
 import static no.ion.utils.exceptions.Exceptions.uncheckIO;
+import static no.ion.utils.exceptions.Exceptions.uncheckIOMap;
 
 /**
- * A UNIX pathname.
+ * Represents a file system path on a UNIX system.
+ *
+ * <h2>UNIX pathnames</h2>
+ *
+ * <p>Any non-empty string is a valid pathname, and is of the following form:</p>
+ *
+ * <pre>
+ *     pathname: absolute | relative
+ *     absolute:
+ *         "/"+
+ *         ("/"+ filename)+ "/"*
+ *     relative:
+ *         filename ("/"+ filename)* "/"*
+ *     filename:  # Also known as "pathname component" or just "component"
+ *         "." | ".." | nodot-filename
+ *     nodot-filename:
+ *         # Not equal to "." or "..", at least one byte, but none equal to '/' or '\0'.
+ * </pre>
+ *
+ * <p>A pathname can be normalized:  It is guaranteed to resolve to the same file, and simplifies the pathname:</p>
+ *
+ * <ol>
+ *     <li>A sequence of {@code '/'} is collapsed to one {@code '/'}.</li>
+ *     <li>{@code "."} filenames are removed.</li>
+ *     <li>{@code ".."} filenames in the root directory are removed.</li>
+ *     <li>Any {@code '/'} following the last filename are removed.</li>
+ * </ol>
+ *
+ * <p>The resulting normalized pathname has the following form:</p>
+ *
+ * <pre>
+ *     pathname: absolute | relative
+ *     absolute:
+ *         "/"
+ *         "/" nodot-filename ("/" rel-filename)*
+ *     relative:
+ *         "."
+ *         rel-filename ("/" rel-filename)*
+ *     rel-filename:
+ *         ".."
+ *         nodot-filename
+ * </pre>
+ *
+ * <p>Trailing {@code '/'} are removed because that's what {@link java.nio.file.Path java.nio.file.Path} does.
+ * If the filenames of a pathname is known to NOT be symbolic links, then further normalization can be done:</p>
+ *
+ * <ol start="5">
+ *     <li>If a {@code nodot-filename} precedes a {@code ".."} filename, then both are removed.</li>
+ * </ol>
+ *
+ * <h2>Java support for UNIX pathnames</h2>
+ *
+ * <h4>Representation</h4>
+ *
+ * <p>Java represents UNIX paths with an internal byte[], and all paths obtained from the OS
+ * (e.g. reading the directory entries) preserve the correct representation.  Resolutions
+ * between such paths are also correct (path1.resolve(path2) resolves on the byte[] paths).</p>
+ *
+ * <h4>Java APIs</h4>
+ *
+ * <p>Unfortunately, the byte[] is not exposed through the Java APIs.  Instead String is exposed,
+ * and UTF-8 is used to convert to and from.  Thus invalid UTF-8 paths cannot be created or inspected
+ * correctly by Java code.  Invalid conversions are handled differently by different APIs, for example:</p>
+ *
+ * <ul>
+ *     <li>{@link Path#toString()} replaces invalid UTF-8 bytes with the Unicode replacement character (0xFFFD).</li>
+ *     <li>{@link Path#of(String, String...)} throws {@link UnmappableCharacterException} if the String has no
+ *     UTF-8 encoding.</li>
+ * </ul>
+ *
+ * <h4>Implicit normalization</h4>
+ *
+ * <p>A path constructed from a String always does the following normalizations:</p>
+ *
+ * <ol>
+ *     <li>Multiple consecutive "/" are collapsed to one "/".</li>
+ *     <li>Any trailing "/" are removed.<br>
+ *     This is semantically wrong in UNIX, as a pathname with a trailing "/" must refer to a directory.</li>
+ * </ol>
+ *
+ * <h4>Explicit normalization</h4>
+ *
+ * <p>A Java path can be (explicitly) normalized with {@link Path#normalize()}.</p>
+ *
+ * <ol start="3">
+ *     <li>"." components are removed.</li>
+ *     <li>A non-".." component followed by a ".." component are both removed.<br>
+ *     This is semantically wrong in UNIX, as the first component may be a symlink.
+ *     However, it is our opinion that most of the times ".." are appended to the path
+ *     (before a non-".." component), they actually mean to remove the last component.</li>
+ *     <li>A path without any components is represented by the empty string.
+ *     For example, both "." and "foo/.." are normalized to "".<br>
+ *     An empty path is invalid in UNIX.</li>
+ *     <li>"/.." resolves to "/".</li>
+ * </ol>
+ *
+ * <h4>Parent path</h4>
+ *
+ * <p>The {@link Path#getParent()} removes the last component, which may be a ".." component.  If no component can
+ * be removed, null is returned.  This is very unintuitive behavior for one thinking about parent directory,
+ * or otherwise manipulating a UNIX pathname.</p>
+ *
+ * <h2>Pathname</h2>
+ *
+ * <p>By default, a Pathname is represented by {@code Path.of(path).normalize()}, except that where Path would end up
+ * with an empty path, a Pathname of "." is used instead.</p>
  */
 @Immutable
-public class Pathname {
+public class Pathname implements AnchoredPathname {
+    private static final String MAVEN_TEST_DIRECTORY = "Pathname.d";
+
     private final Path path;
 
-    public static Pathname rootIn(FileSystem fileSystem) { return new Pathname(fileSystem.getPath("/")); }
+    /** Returns the root directory. */
+    public static Pathname rootDirectory() { return of("/"); }
 
-    public static Pathname workingIn(FileSystem fileSystem) {
-        String userDir = System.getProperty("user.dir");
-        requireNonNull(userDir, "user.dir system property not set");
-        Path path = fileSystem.getPath(userDir);
+    /** Returns the "." pathname, aka the relative pathname of the current working directory. */
+    public static Pathname currentDirectory() { return of("."); }
+
+    /** Returns the ".." pathname, see also {@link #parent()}. */
+    public static Pathname parentDirectory() { return of(".."); }
+
+    /** Returns the absolute pathname of the current working directory. */
+    public static Pathname absoluteCurrentDirectory() {
+        return of(requireNonNull(System.getProperty("user.dir"), "user.dir system property not set"));
+    }
+
+    /** Returns the home directory of the user (of the JVM process). */
+    public static Pathname homeDirectory() {
+        return of(requireNonNull(System.getProperty("user.home"), "user.home system property not set"));
+    }
+
+    /** Returns the absolute pathname to the process-wide temporary directory. */
+    public static Pathname temporaryDirectory() {
+        return of(requireNonNull(System.getProperty("java.io.tmpdir", "java.io.tmpdir system property not set")));
+    }
+
+    /** Returns the Pathname from the String representation. */
+    public static Pathname of(String pathname) { return of(Path.of(pathname)); }
+
+    /** Returns the Pathname from the Path representation. */
+    public static Pathname of(Path path) { return new Pathname(normalize(path)); }
+
+    /** Same as {@link Path#normalize()}, except that "." is returned instead of an empty path. */
+    private static Path normalize(Path path) {
+        Path normalized = path.normalize();
+        // "/" has getNameCount() == 0, but isAbsolute().
+        return !normalized.isAbsolute() &&
+               (normalized.getNameCount() == 0 ||
+                (normalized.getNameCount() == 1 && normalized.getName(0).toString().isEmpty())) ?
+               path.getFileSystem().getPath(".") :
+               normalized;
+    }
+
+    /**
+     * Will not normalize path.
+     *
+     * <p>This is useful if e.g. a path component is followed by a ".." component, as normalization would remove both.</p>
+     */
+    public static Pathname ofPreserve(Path path) {
         return new Pathname(path);
     }
 
-    public static Pathname homeIn(FileSystem fileSystem) {
-        String userHome = System.getProperty("user.home");
-        requireNonNull(userHome, "user.home system property not set");
-        Path path = fileSystem.getPath(userHome);
-        return new Pathname(path);
-    }
+    private Pathname(Path path) { this.path = requireNonNull(path); }
 
-    public static Pathname of(FileSystem fileSystem, String first, String... more) {
-        return new Pathname(fileSystem.getPath(first, more));
-    }
+    public Path toPath() { return path; }
+    @Override public String toString() { return path.toString(); }
 
-    public interface TemporaryPathname extends AutoCloseable {
-        Pathname pathname();
-
-        /** Deletes pathname.  For a directory, deletes all files and directories in the directory, recursively. */
-        @Override void close();
-    }
-
-    public static TemporaryPathname tmpFileIn(FileSystem fileSystem, FileAttribute<?> attrs) {
-        Path tmpdir = tmpdir(fileSystem);
-        var tmpFile = new Pathname(uncheckIO(() -> Files.createTempFile(tmpdir, "", "", attrs)));
-
-        var cleanupThread = new Thread(() -> cleanupTmpFile(tmpFile));
-        Runtime.getRuntime().addShutdownHook(cleanupThread);
-
-        return new TemporaryPathname() {
-            @Override public Pathname pathname() { return tmpFile; }
-
-            @Override
-            public void close() {
-                try {
-                    Runtime.getRuntime().removeShutdownHook(cleanupThread);
-                } catch (IllegalStateException e) {
-                    // is already shutting down - too late
-                }
-
-                cleanupTmpFile(tmpFile);
-            }
+    /**
+     * Return true if the pathname has at least one component (i.e. is not "/"),
+     * and the last component is not "." nor "..".  In this case, {@code this.equals(parent().resolve(filename()))}.
+     */
+    public boolean hasFilename() {
+        Path filenamePath = path.getFileName();
+        if (filenamePath == null) return false;  // path is "/"
+        return switch (filenamePath.toString()) {
+            case ".", ".." -> false;
+            default -> true;
         };
     }
 
-    public static TemporaryPathname tmpDirectoryIn(FileSystem fileSystem, FileAttribute<?> attrs) {
-        Path tmpdir = tmpdir(fileSystem);
-        var tmpDirectory = new Pathname(uncheckIO(() -> Files.createTempDirectory(tmpdir, "", attrs)));
-
-        var cleanupThread = new Thread(() -> cleanupTmpDirectory(tmpDirectory));
-        Runtime.getRuntime().addShutdownHook(cleanupThread);
-
-        return new TemporaryPathname() {
-            @Override public Pathname pathname() { return tmpDirectory; }
-
-            @Override
-            public void close() {
-                try {
-                    Runtime.getRuntime().removeShutdownHook(cleanupThread);
-                } catch (IllegalStateException e) {
-                    // is already shutting down - too late
-                }
-
-                cleanupTmpDirectory(tmpDirectory);
-            }
-        };
+    /** Returns the last component, or empty for "/" (which is the only normalized pathname without any last component). */
+    public String filename() throws IllegalStateException {
+        Path filenamePath = path.getFileName();
+        if (filenamePath == null) return "";  // path is "/"
+        return filenamePath.toString();
     }
 
-    public Pathname(Path path) { this.path = requireNonNull(path); }
+    public int components() { return path.getNameCount(); }
+    public boolean isEmpty() { return path.toString().isEmpty(); }
 
-    public Path path() { return path; }
+    /**
+     * Returns the parent pathname, examples:
+     *
+     * <pre>
+     * Original        Pathname.parent()  Path.getParent()
+     * "/"             "/"                null
+     * "/foo"          "/"                "/"
+     * "/foo/.."       "/"                "/foo"
+     * "."             ".."               null
+     * ".."            "../.."            ""
+     * "./."           ".."               "."
+     * "foo/bar/.."    "."                null
+     * "../foo"        ".."               ".."
+     * </pre>
+     *
+     * <p>Note that consecutive components of the form <code>foo/..</code> are removed,
+     * which is wrong if <code>foo</code> is a symbolic link to another directory.</p>
+     */
+    public Pathname parent() { return of(path.resolve("..")); }
 
-    public Pathname root() { return rootIn(fileSystem()); }
-    public Pathname working() { return workingIn(fileSystem()); }
-    public Pathname home() { return homeIn(fileSystem()); }
-    public TemporaryPathname tmpFile(FileAttribute<?> attrs) { return tmpFileIn(fileSystem(), attrs); }
-    public TemporaryPathname tmpDir(FileAttribute<?> attrs) { return tmpDirectoryIn(fileSystem(), attrs); }
-    public Pathname of(String first, String... more) { return of(fileSystem(), first, more); }
+    @Override public Pathname resolve(Pathname other) { return of(path.resolve(other.path)); }
+    @Override public Pathname resolve(String other) { return of(path.resolve(other)); }
+    @Override public Pathname resolve(Path other) { return of(path.resolve(other)); }
 
-    public Pathname resolve(String other) { return new Pathname(path.resolve(other)); }
-    public Pathname realPath(LinkOption... linkOptions) {
-        return new Pathname(uncheckIO(() -> path.toRealPath(linkOptions)));
-    }
+    /** Resolves any symbolic link components, and returns the resolved path. Throws if there is no such file. */
+    public Pathname realPath() { return new Pathname(uncheckIO(() -> path.toRealPath())); }
 
-    public Pathname parent() { return parent(true); }
-    public Pathname parentNoSymlink() { return parent(false); }
-
-    public Pathname parent(boolean symlinks) {
-        String parentPath = NormalPathnameBuilder
-                .ofPathname(path.toString(), symlinks)
-                .parent()
-                .toString();
-        return of(parentPath);
-    }
-
-    public boolean exists(LinkOption... linkOptions) { return Files.exists(path, linkOptions); }
-    public boolean isDirectory(LinkOption... linkOptions) { return Files.isDirectory(path, linkOptions); }
-    public boolean isRegularFile(LinkOption... linkOptions) { return Files.isRegularFile(path, linkOptions); }
-    public boolean isSymbolicLink() { return Files.isSymbolicLink(path); }
-
+    /** Test whether the path refers to a file. If pathname is a dangling symlink, then false is returned. */
+    public boolean exists() { return Files.exists(path); }
     public boolean isReadable() { return Files.isReadable(path); }
     public boolean isWriteable() { return Files.isWritable(path); }
     public boolean isExecutable() { return Files.isExecutable(path); }
 
-    public long size() { return uncheckIO(() -> Files.size(path)); }
+    /** Returns a list of pathnames to the directory entries, with each pathname being the directory entry filename resolved against {@code this} pathname. */
+    public List<Pathname> listDirectory() {
+        Stream<Path> directoryEntryStream = uncheckIO(() -> Files.list(path));
+        try (var closer = directoryEntryStream) {
+            return directoryEntryStream.map(Pathname::of).toList();
+        }
+    }
+
+    public Optional<OpenDirectory> openDirectoryIfExists() {
+        Optional<DirectoryStream<Path>> stream = uncheckIOMap(() -> Files.newDirectoryStream(path), NoSuchFileException.class);
+        return stream.map(stream2 -> OpenDirectory.from(this, stream2));
+    }
+
+    public OpenDirectory openDirectory() {
+        DirectoryStream<Path> stream = uncheckIO(() -> Files.newDirectoryStream(path));
+        return OpenDirectory.from(this, stream);
+    }
+
+    public void createDirectory() {
+        uncheckIO(() -> Files.createDirectory(path));
+    }
+
+    public void createDirectories() {
+        uncheckIO(() -> Files.createDirectories(path));
+    }
+
+    public int deleteDirectoryEntriesRecursively() {
+        Optional<OpenDirectory> directory = openDirectoryIfExists();
+        if (directory.isEmpty()) return 0;
+        try (var closer = directory.get()) {
+            return directory.get().deleteEntries();
+        }
+    }
+
+    public int deleteDirectoryRecursively() {
+        return deleteDirectoryEntriesRecursively() + (deleteIfExists() ? 1 : 0);
+    }
+
+    public String readString() { return uncheckIO(() -> Files.readString(path)); }
+
+    public byte[] readBytes() { return uncheckIO(() -> Files.readAllBytes(path)); }
 
     /**
-     * Returns paths to the directory entries of this, assuming this is a directory. If this has path P, and
-     * a directory entry has filename F, then the directory entry's path in the list is P.resolve(F).
+     * Write string to file.
+     *
+     * @param content the String is converted to UTF-8
+     * @param options Defaults to StandardOpenOption.CREATE, TRUNCATE_EXISTING, and WRITE.
+     * @return this
      */
-    public List<Pathname> listDirectory() { return listDirectory(pathname -> true); }
-
-    public List<Pathname> listDirectory(Predicate<Pathname> include) {
-        try (Stream<Path> pathStream = uncheckIO(() -> Files.list(path))) {
-            return pathStream.map(Pathname::new).filter(include).collect(Collectors.toList());
-        }
-    }
-
-    public List<String> listDirectoryEntries() { return listDirectoryEntries(filename -> true); }
-
-    /** List the directory entry filenames in alphabetical order.  Returns empty list if not a directory. */
-    public List<String> listDirectoryEntries(Predicate<String> include) {
-        try (Stream<Path> pathStream = Files.list(path)) {
-            return pathStream.map(Path::getFileName)
-                             .map(Path::toString)
-                             .filter(include)
-                             .sorted()
-                             .collect(Collectors.toList());
-        } catch (NotDirectoryException e) {
-            return List.of();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-    }
-
-    public Pathname createDirectory() {
-        uncheckIO(() -> Files.createDirectory(path));
+    public Pathname writeString(String content, OpenOption... options) {
+        uncheckIO(() -> Files.writeString(path, content, options));
         return this;
     }
 
-    public Pathname createParentDirectories() {
-        parent().createDirectories();
+    /**
+     * Write bytes to file.
+     *
+     * @param content the bytes to write
+     * @param options Defaults to StandardOpenOption.CREATE, TRUNCATE_EXISTING, and WRITE.
+     * @return this
+     */
+    public Pathname write(byte[] content, OpenOption... options) {
+        uncheckIO(() -> Files.write(path, content, options));
         return this;
-    }
-
-    public Pathname createDirectories() {
-        uncheckIO(() -> Files.createDirectories(path));
-        return this;
-    }
-
-    public String readUtf8() { return read(StandardCharsets.UTF_8); }
-
-    public String read(Charset charset) { return uncheckIO(() -> Files.readString(path, charset)); }
-
-    public byte[] read() { return uncheckIO(() -> Files.readAllBytes(path)); }
-
-    public Pathname writeUtf8(String content) { return write(content.getBytes(StandardCharsets.UTF_8)); }
-
-    public Pathname write(byte[] bytes) {
-        uncheckIO(() -> Files.write(path, bytes));
-        return this;
-    }
-
-    public void appendUtf8File(String content) {
-        uncheckIO(() -> Files.writeString(path, content, StandardCharsets.UTF_8, StandardOpenOption.APPEND));
     }
 
     public Pathname delete() {
@@ -223,163 +322,70 @@ public class Pathname {
 
     public boolean deleteIfExists() { return uncheckIO(() -> Files.deleteIfExists(path)); }
 
-    public int deleteDirectoryRecursively() {
-        int entriesDeleted = deleteDentriesRecursively(this);
-        boolean deleted = deleteIfExists();
-        return entriesDeleted + (deleted ? 1 : 0);
+    @Override
+    public void setPermissions(FilePermissions permissions, LinkOption... linkOptions) {
+        PosixUtil.setPermissions(permissions, getPosixFileAttributesView(linkOptions));
     }
 
-    /**
-     * Returns empty if name is "OWNER@", "GROUP@", or "EVERYONE@", or is parsable as an int.
-     * Otherwise, a user principal is returned if a password file entry for the given name was found with getpwnam(3),
-     * or empty otherwise.
-     */
-    public Optional<UserPrincipal> lookupUserPrincipal(String name) {
-        requireNonNull(name);
-
-        if (name.equals("OWNER@") || name.equals("GROUP@") || name.equals("EVERYONE@"))
-            return Optional.empty();
-
-        try {
-            Integer.parseInt(name);
-        } catch (NumberFormatException e) {
-            return Optional.empty();
-        }
-
-        UserPrincipalLookupService userPrincipalLookupService = fileSystem().getUserPrincipalLookupService();
-
-        final UserPrincipal userPrincipal;
-        try {
-            // The uid of the returned UserPrincipal is:
-            //  - -1 if name is one of "OWNER@", "GROUP@", or "EVERYONE@", otherwise
-            //  - the uid of name, if found via getpwname, otherwise
-            //  - name, if name is parsable as an int, otherwise
-            //  - UserPrincipalNotFoundException is thrown.
-            //
-            //  Not in particular that setOwner on a UserPrincipal with uid -1 will not change the uid of the file.
-
-            // If name is one of "OWNER@", "GROUP@", or "EVERYONE@", a special UserPrincipal is returned
-            // with uid -1 and that name.  If name is NOT found via getpwnam(3), but is an int, a UserPrincipal
-            // with that uid is returned.
-            userPrincipal = userPrincipalLookupService.lookupPrincipalByName(name);
-        } catch (UserPrincipalNotFoundException e) {
-            return Optional.empty();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-
-        return Optional.of(userPrincipal);
+    @Override
+    public void setLastModifiedTime(Instant instant, LinkOption... linkOptions) {
+        PosixUtil.setLastModifiedTime(instant, getPosixFileAttributesView(linkOptions));
     }
 
-    public UserPrincipal owner(LinkOption... linkOptions) {
-        return uncheckIO(() -> Files.getOwner(path, linkOptions));
+    @Override
+    public void setOwner(String owner, LinkOption... linkOptions) {
+        PosixUtil.setOwner(owner, getPosixFileAttributesView(linkOptions), path);
     }
 
-    public String ownerName(LinkOption... linkOptions) { return owner(linkOptions).getName(); }
-
-    /** @return this */
-    public Pathname setOwner(String username, LinkOption... linkOptions) {
-        UserPrincipal userPrincipal = lookupUserPrincipal(username)
-                .orElseThrow(() -> new IllegalArgumentException("Not a username: " + username));
-        return setOwner(userPrincipal, linkOptions);
+    @Override
+    public void setGroup(String group, LinkOption... linkOptions) {
+        PosixUtil.setGroup(group, getPosixFileAttributesView(linkOptions), path);
     }
 
-    /** @return this */
-    public Pathname setOwner(UserPrincipal user, LinkOption... linkOptions) {
-        FileOwnerAttributeView view = Files.getFileAttributeView(path, FileOwnerAttributeView.class, linkOptions);
-        if (view == null)
-            throw new UnsupportedOperationException();
-
-        uncheckIO(() -> view.setOwner(user));
-        return this;
+    /** Creates a new and randomly named regular file in this directory. */
+    private Pathname createFile(String prefix, String suffix) {
+        return Pathname.of(uncheckIO(() -> Files.createTempFile(path, prefix, suffix)));
     }
 
-    /**
-     * Returns empty if name is parsable as int.  If name is an existing group name according to getgrnam(3),
-     * its group principal is returned, otherwise empty is returned.
-     */
-    public Optional<GroupPrincipal> lookupGroupPrincipal(String name) {
-        try {
-            Integer.parseInt(name);
-        } catch (NumberFormatException e) {
-            return Optional.empty();
-        }
-
-        UserPrincipalLookupService userPrincipalLookupService = fileSystem().getUserPrincipalLookupService();
-
-        try {
-            return Optional.of(userPrincipalLookupService.lookupPrincipalByGroupName(name));
-        } catch (UserPrincipalNotFoundException e) {
-            return Optional.empty();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+    /** Creates a new and randomly named regular file in this directory. */
+    private Pathname createFile(String prefix, String suffix, FilePermissions permissions) {
+        return Pathname.of(uncheckIO(() -> Files.createTempFile(path, prefix, suffix, permissions.toFileAttribute())));
     }
 
-    public GroupPrincipal group(LinkOption... linkOptions) {
-        return posixFileAttributes(linkOptions).group();
+    /** Creates a new and randomly named directory in this directory. */
+    private Pathname createDirectory(String prefix) {
+        return Pathname.of(uncheckIO(() -> Files.createTempDirectory(path, prefix)));
     }
 
-    public String groupName(LinkOption... linkOptions) {
-        return group(linkOptions).getName();
+    /** Creates a new and randomly named directory in this directory. */
+    private Pathname createDirectory(String prefix, FilePermissions permissions) {
+        return Pathname.of(uncheckIO(() -> Files.createTempDirectory(path, prefix, permissions.toFileAttribute())));
     }
 
-    public Pathname setGroup(String groupName, LinkOption... linkOptions) {
-        GroupPrincipal group = lookupGroupPrincipal(groupName)
-                .orElseThrow(() -> new IllegalArgumentException("Not a group: " + groupName));
-        return setGroup(group);
-    }
+    /** Create a symbolic link file located at {@code this} pathname, with the contents {@code content.toString()}. */
+    public void createSymbolicLink(String content) { createSymbolicLink(path.getFileSystem().getPath(content)); }
+    public void createSymbolicLink(Pathname content) { createSymbolicLink(content.toPath()); }
+    public void createSymbolicLink(Path content) { uncheckIO(() -> Files.createSymbolicLink(path, content)); }
 
-    public Pathname setGroup(GroupPrincipal group, LinkOption... linkOptions) {
-        PosixFileAttributeView view = posixFileAttributesView(linkOptions);
-        uncheckIO(() -> view.setGroup(group));
-        return this;
-    }
+    public String readLink() { return uncheckIO(() -> Files.readSymbolicLink(path)).toString(); }
 
-    public Set<PosixFilePermission> permissionSet(LinkOption... linkOptions) {
-        return uncheckIO(() -> Files.getPosixFilePermissions(path, linkOptions));
-    }
-
-    public Pathname setPermissions(Set<PosixFilePermission> permissions) {
-        uncheckIO(() -> Files.setPosixFilePermissions(path, permissions));
-        return this;
-    }
-
-    public Pathname setLastModifiedTime(Instant instant) {
-        uncheckIO(() -> Files.setLastModifiedTime(path, FileTime.from(instant)));
-        return this;
-    }
-
-    public <T extends BasicFileAttributeView> T readAttributeViewOrThrow(Class<T> klass, LinkOption... linkOptions) {
-        T view = uncheckIO(() -> Files.getFileAttributeView(path, klass, linkOptions));
-        return requireNonNull(view, klass.getName() + " is not a supported file attribute view");
-    }
-
-    public <T extends BasicFileAttributes> T readAttributes(Class<T> klass, LinkOption... linkOptions) {
-        // AFAIK readAttributes cannot return null and would instead throw UnsupportedOperationException or
-        // NullPointerException.  But I have seen Java internal code that tests for null.
-        return Objects.requireNonNull(uncheckIO(() -> Files.readAttributes(path, klass, linkOptions)));
-    }
-
-    private PosixFileAttributeView posixFileAttributesView(LinkOption... linkOptions) {
+    private PosixFileAttributeView getPosixFileAttributesView(LinkOption... linkOptions) {
         return Files.getFileAttributeView(path, PosixFileAttributeView.class, linkOptions);
     }
 
-    private PosixFileAttributes posixFileAttributes(LinkOption... linkOptions) {
-        PosixFileAttributeView attributeView = posixFileAttributesView(linkOptions);
+    private PosixFileAttributes readPosixFileAttributes(LinkOption... linkOptions) {
+        PosixFileAttributeView attributeView = getPosixFileAttributesView(linkOptions);
         return uncheckIO(attributeView::readAttributes);
     }
 
-    // UNIX specific interfaces below.  In particular not supported by JimFS.
+    // UNIX specific interfaces below.  Not supported by JimFS.
 
-
-    /** @return this */
-    public Pathname setOwner(int uid, LinkOption... linkOptions) {
+    public Pathname setOwner(int uid, LinkOption... linkOptions) throws UncheckedIOException {
         uncheckIO(() -> Files.setAttribute(path, "unix:uid", uid, linkOptions));
         return this;
     }
 
-    public Pathname setGroup(int gid, LinkOption... linkOptions) {
+    public Pathname setGroup(int gid, LinkOption... linkOptions) throws UncheckedIOException {
         // See UnixFileAttributeViews
         uncheckIO(() -> Files.setAttribute(path, "unix:gid", gid, linkOptions));
         return this;
@@ -392,24 +398,29 @@ public class Pathname {
     }
 
     public Pathname setMode(int mode, LinkOption... linkOptions) {
-        // See UnixFileAttributeViews
         uncheckIO(() -> Files.setAttribute(path, "unix:mode", mode, linkOptions));
         return this;
     }
 
-    /** Get file status, see stat(2) and inode(7). Does NOT work with JimFS. */
-    public FileStatus readFileStatus(LinkOption... linkOptions) throws UncheckedIOException {
-        return new FileStatusImpl(uncheckIO(() -> Files.readAttributes(path, "unix:*", linkOptions)));
-    }
-
-    /** Get file status, see stat(2) and inode(7). Does NOT work with JimFS. */
-    public Optional<FileStatus> readFileStatusIfExists(LinkOption... linkOptions) {
-        return probe(() -> readFileStatus(linkOptions), UncheckedIOException.class);
-    }
-
+    /** Get file status, see stat(2), lstat(2), and inode(7). Does NOT work with JimFS. */
     @Override
-    public String toString() {
-        return path.toString();
+    public FileStatus readFileStatus(LinkOption... linkOptions) {
+        Map<String, Object> attributes = uncheckIO(() -> Files.readAttributes(path, "unix:*", linkOptions));
+        return new FileStatus(attributes);
+    }
+
+    /** Get file status, see stat(2), lstat(2), and inode(7). Does NOT work with JimFS. */
+    @Override
+    public Optional<FileStatus> readFileStatusIfExists(LinkOption... linkOptions) {
+        Map<String, Object> attributes;
+        try {
+            attributes = Files.readAttributes(path, "unix:*", linkOptions);
+        } catch (NoSuchFileException e) {
+            return Optional.empty();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return Optional.of(new FileStatus(attributes));
     }
 
     @Override
@@ -425,57 +436,53 @@ public class Pathname {
         return Objects.hash(path);
     }
 
-    /** Returns the number of files and directories that were deleted. */
-    private static int deleteDentriesRecursively(Pathname pathname) {
-        Stream<Path> pathStream;
-        try {
-            pathStream = Files.list(pathname.path);
-        } catch (NoSuchFileException e) {
-            // Directory already deleted, OK
-            return 0;
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
+    /**
+     * Create or clear, and return the directory {@code Pathname.of("target/Pathname").resolve(testClass.getSimpleName()).resolve(name)}.
+     * The implementation may sanity-check that the JVM is running Maven unit tests.
+     */
+    public static Pathname prepareMavenTestDirectory(Class<?> testClass, String name) {
+        Pathname directory = verifyMavenTest(testClass);
+        if (name != null && !name.isEmpty())
+            directory = directory.resolve(name);
+
+        if (directory.isDirectory()) {
+            directory.deleteDirectoryEntriesRecursively();
+        } else {
+            directory.createDirectories();
         }
 
-        try (pathStream) {
-            return pathStream.map(Pathname::new)
-                             .map(entry -> {
-                                 int numDeleted = 0;
+        return directory;
+    }
 
-                                 // Make sure the symlink is deleted, not whatever the symlink points to!
-                                 var attr = entry.readAttributes(BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                                 if (!attr.isSymbolicLink() && attr.isDirectory()) {
-                                     numDeleted += deleteDentriesRecursively(entry);
-                                 }
+    /** Remove all directories created with the same testClass.  Ideally called in unit test tear down. */
+    public static void deleteMavenTestDirectory(Class<?> testClass) {
+        Pathname directory = verifyMavenTest(testClass);
+        directory.deleteDirectoryRecursively();
+    }
 
-                                 boolean deleted = entry.deleteIfExists();
-                                 return numDeleted + (deleted ? 1 : 0);
-                             })
-                             .mapToInt(Integer::intValue).sum();
+    private static Pathname verifyMavenTest(Class<?> testClass) {
+        verifyMavenDirectories("src/main/java", "src/test/java", "target");
+        String junitClassPath = Pathname.of("src/test/java")
+                                        .resolve(testClass.getName().replace('.', '/') + ".java")
+                                        .toString();
+        verifyMavenFiles("pom.xml", junitClassPath);
+
+        return Pathname.of("target").resolve(MAVEN_TEST_DIRECTORY).resolve(testClass.getSimpleName());
+    }
+
+    private static void verifyMavenFiles(String... files) {
+        for (var file : files) {
+            if (!Pathname.of(file).isRegularFile())
+                throw new UncheckedIOException("Failed to verify JVM is running Maven unit tests",
+                                               new NoSuchFileException(file));
         }
     }
 
-    private static void cleanupTmpFile(Pathname tmpFile) {
-        try {
-            tmpFile.delete();
-        } catch (UncheckedIOException ignore) {}
-    }
-
-    private static void cleanupTmpDirectory(Pathname tmpDirectory) {
-        try {
-            tmpDirectory.deleteDirectoryRecursively();
-        } catch (UncheckedIOException ignore) {}
-    }
-
-    private static Path tmpdir(FileSystem fileSystem) {
-        String tmpdir = System.getProperty("java.io.tmpdir");
-        Objects.requireNonNull(tmpdir, "java.io.tmpdir system property is not set");
-        return fileSystem.getPath(tmpdir);
-    }
-
-    private FileSystem fileSystem() { return path.getFileSystem(); }
-
-    private boolean hasStatus(Predicate<FileStatus> predicate, LinkOption... linkOptions) {
-        return readFileStatusIfExists(linkOptions).filter(predicate).isPresent();
+    private static void verifyMavenDirectories(String... directories) {
+        for (var directory : directories) {
+            if (!Pathname.of(directory).isDirectory())
+                throw new UncheckedIOException("Failed to verify JVM is running Maven unit tests",
+                                               new NotDirectoryException(directory));
+        }
     }
 }
