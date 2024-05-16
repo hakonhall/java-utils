@@ -1,6 +1,5 @@
 package no.ion.utils.io;
 
-import javax.annotation.concurrent.Immutable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.UnmappableCharacterException;
@@ -132,7 +131,6 @@ import static no.ion.utils.exceptions.Exceptions.uncheckIOMap;
  * <p>By default, a Pathname is represented by {@code Path.of(path).normalize()}, except that where Path would end up
  * with an empty path, a Pathname of "." is used instead.</p>
  */
-@Immutable
 public class Pathname implements AnchoredPathname {
     private static final String MAVEN_TEST_DIRECTORY = "Pathname.d";
 
