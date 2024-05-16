@@ -19,7 +19,7 @@ public enum FileType {
             }
         }
 
-        throw new IllegalArgumentException("Failed to find file type from mode: " + mode);
+        throw new IllegalArgumentException("Failed to find file type from mode: %04o".formatted(mode));
     }
 
     private final int S_IF;

@@ -36,6 +36,7 @@ public class TestTask implements Task, AutoCloseable {
 
         synchronized (monitor) {
             state = State.POST_RUN;
+            monitor.notifyAll();
 
             while (!cancelled) {
                 try { monitor.wait(); } catch (InterruptedException ignored) {}

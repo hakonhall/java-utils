@@ -1,94 +1,155 @@
 package no.ion.utils.io;
 
-import no.ion.io.TestFileSystem;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 
-import java.nio.file.FileSystem;
-import java.nio.file.Files;
-import java.util.Set;
-import java.util.stream.Collectors;
+import java.nio.file.Path;
+import java.time.Instant;
 
+import static no.ion.utils.exceptions.Exceptions.uncheckIO;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PathnameTest {
-    private final FileSystem fileSystem = TestFileSystem.create();
+    @AfterAll
+    static void tearDown() {
+        Pathname.deleteMavenTestDirectory(PathnameTest.class);
+    }
 
     @Test
-    void verifyInMemoryOperations() {
-        assertEquals("/", Pathname.rootIn(fileSystem).toString());
+    void pathnames() {
+        assertEquals(Path.of("/"), Pathname.rootDirectory().toPath());
+        assertEquals(Path.of("."), Pathname.currentDirectory().toPath());
+        assertEquals(Path.of(".."), Pathname.parentDirectory().toPath());
+        assertEquals(Path.of(".").toAbsolutePath().normalize().toString(), Pathname.absoluteCurrentDirectory().toString());
+        assertEquals(uncheckIO(() -> Path.of(".").toRealPath()), Pathname.absoluteCurrentDirectory().toPath());
 
-        var absolutePathname = new Pathname(fileSystem.getPath("/foo/bar"));
+        assertEquals("/", Pathname.rootDirectory().toString());
+
+        var absolutePathname = Pathname.of("/foo/bar");
 
         assertEquals("/foo/bar", absolutePathname.toString());
-        assertEquals("/foo/bar", absolutePathname.path().toString());
+        assertEquals("/foo/bar", absolutePathname.toPath().toString());
 
-        assertEquals("/foo", absolutePathname.parentNoSymlink().toString());
-        assertEquals("/", absolutePathname.parentNoSymlink().parentNoSymlink().toString());
-        assertEquals("/", absolutePathname.parentNoSymlink().parentNoSymlink().parentNoSymlink().toString());
+        assertEquals("/foo", absolutePathname.parent().toString());
+        assertEquals("/", absolutePathname.parent().parent().toString());
+        assertEquals("/", absolutePathname.parent().parent().parent().toString());
         assertEquals("/foo/bar/zoo", absolutePathname.resolve("zoo").toString());
         assertEquals("/zoo", absolutePathname.resolve("/zoo").toString());
-        assertEquals("/foo/bar/../zoo", absolutePathname.resolve("../zoo").toString());
-
-        absolutePathname.createParentDirectories();
-        assertTrue(Files.isDirectory(absolutePathname.parent().path()));
-
-        assertTrue(absolutePathname.parent().exists());
-        assertTrue(absolutePathname.parent().isDirectory());
-        assertTrue(absolutePathname.parent().isReadable());
-        assertTrue(absolutePathname.parent().isExecutable());
-        assertFalse(absolutePathname.parent().isRegularFile());
-        assertFalse(absolutePathname.parent().isSymbolicLink());
-
-        assertTrue(absolutePathname.exists());
-        assertTrue(absolutePathname.isDirectory());
-        assertTrue(absolutePathname.isReadable());
-        assertTrue(absolutePathname.isExecutable());
-        assertFalse(absolutePathname.isRegularFile());
-        assertFalse(absolutePathname.isSymbolicLink());
+        assertEquals("/foo/zoo", absolutePathname.resolve("../zoo").toString());
 
         // Test that a reference-unequal UnixPath is equals() and same hashCode() as another with same path.
-        var parentUnixPath = new Pathname(fileSystem.getPath("/foo"));
+        var parentUnixPath = Pathname.of("/foo");
         assertNotEquals(absolutePathname, parentUnixPath);
         assertEquals(absolutePathname, parentUnixPath.resolve("bar"));
         assertEquals(absolutePathname.hashCode(), parentUnixPath.resolve("bar").hashCode());
 
-        var relativePath = new Pathname(fileSystem.getPath("foo/bar"));
+        var relativePath = Pathname.of("foo/bar");
         assertEquals("foo/bar", relativePath.toString());
-        assertEquals("foo", relativePath.parentNoSymlink().toString());
-        assertEquals(".", relativePath.parentNoSymlink().parentNoSymlink().toString());
-        assertEquals("..", relativePath.parentNoSymlink().parentNoSymlink().parentNoSymlink().toString());
+        assertEquals("foo", relativePath.parent().toString());
+        assertEquals(".", relativePath.parent().parent().toString());
+        assertEquals("..", relativePath.parent().parent().parent().toString());
     }
 
     @Test
-    void equality() {
-        Pathname path1 = new Pathname(fileSystem.getPath("/foo"));
-        Pathname path2 = new Pathname(fileSystem.getPath("/foo"));
-        assertEquals(path1, path2);
-        assertEquals(path1.hashCode(), path2.hashCode());
+    void parent() {
+        assertParent("/", "/");
+        assertParent("/foo", "/");
+        assertParent(".", "..");
+        assertParent("..", "../..");
+        assertParent("foo", ".");
+        assertParent("../foo", "..");
+        assertParent("../../bar", "../..");
+        assertParent("../foo/bar", "../foo");
+    }
 
-        Pathname path3 = new Pathname(fileSystem.getPath("/bar"));
-        assertNotEquals(path1, path3);
+    private static void assertParent(String path, String expectedParent) {
+        assertEquals(expectedParent, Pathname.of(path).parent().toString(), "For original path " + path);
     }
 
     @Test
-    void testFile() {
-        var dir = new Pathname(fileSystem.getPath("/dir"));
-        dir.writeUtf8("content");
-        assertEquals("content", dir.readUtf8());
+    void realPath() {
+        var pathname = Pathname.of("target");
+        assertTrue(pathname.exists());
+        var realPathname = pathname.realPath();
+        assertEquals("target", realPathname.filename());
+    }
+
+    @Test
+    void filename() {
+        assertFilename("/bar/foo", "foo", true);
+        assertFilename("foo", "foo", true);
+        assertFilename("../foo", "foo", true);
+        assertFilename(".", ".", false);
+        assertFilename("..", "..", false);
+        assertFilename("/", "", false);
+    }
+
+    private static void assertFilename(String path, String expectedFilename, boolean expectedHasFilename) {
+        var pathname = Pathname.of(path);
+        assertEquals(expectedFilename, pathname.filename());
+        assertEquals(expectedHasFilename, pathname.hasFilename());
+        if (expectedHasFilename)
+            assertEquals(pathname, pathname.parent().resolve(pathname.filename()));
     }
 
     @Test
     void testDirectory() {
-        var directory = new Pathname(fileSystem.getPath("/dir"));
-        directory.createDirectories();
-        directory.resolve("file1").writeUtf8("content");
-        directory.resolve("file2").writeUtf8("content");
-        directory.resolve("dir1").createDirectory();
+        var pathname = Pathname.prepareMavenTestDirectory(PathnameTest.class, "testDirectory");
+        assertEquals("target/Pathname.d/PathnameTest/testDirectory", pathname.toString());
+    }
 
-        assertEquals(Set.of("/dir/file1", "/dir/file2", "/dir/dir1"),
-                     directory.listDirectory().stream().map(Pathname::toString).collect(Collectors.toSet()));
+    @Test
+    void symbolicLinks() {
+        var directory = Pathname.prepareMavenTestDirectory(PathnameTest.class, "symbolicLinks");
+        var symlink = directory.resolve("link");
+        symlink.createSymbolicLink("../foo");
+        assertEquals("../foo", symlink.readLink());
+    }
+
+    @Test
+    void equality() {
+        Pathname path1 = Pathname.of("/foo");
+        Pathname path2 = Pathname.of("/foo");
+        assertEquals(path1, path2);
+        assertEquals(path1.hashCode(), path2.hashCode());
+
+        Pathname path3 = Pathname.of("/bar");
+        assertNotEquals(path1, path3);
+    }
+
+    @Test
+    void simpleDirectoryAndFileOperations() {
+        var target = Pathname.of("target");
+        assertTrue(target.exists());
+        FileStatus fileStatus = target.readFileStatus();
+        assertTrue(fileStatus.isDirectory());
+        assertFalse(fileStatus.isRegularFile());
+        assertFalse(fileStatus.isSymbolicLink());
+        assertFalse(fileStatus.isOther());
+        assertEquals(fileStatus.type(), FileType.DIRECTORY);
+        assertFalse(fileStatus.owner().isEmpty());
+        assertFalse(fileStatus.group().isEmpty());
+        assertFalse(fileStatus.mode().setUserId());
+        assertFalse(fileStatus.mode().setGroupId());
+        assertFalse(fileStatus.mode().sticky());
+        assertEquals(fileStatus.mode().toFilePermissions(), fileStatus.permissions());
+        assertTrue(fileStatus.size() > 0L);
+        assertTrue(fileStatus.lastModifiedTime().isBefore(Instant.now()));
+
+        assertTrue(target.readFileStatusIfExists().isPresent());
+
+        var directory = target.resolve("unit-tests/PathnameTest/simpleDirectoryAndFileOperations");
+        directory.deleteDirectoryRecursively();
+        assertFalse(directory.exists());
+        directory.createDirectories();
+        assertTrue(directory.exists());
+
+        var file = directory.resolve("file.txt");
+        file.writeString("content");
+        assertEquals("content", file.readString());
+        assertTrue(file.deleteIfExists());
     }
 }

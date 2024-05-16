@@ -17,7 +17,7 @@ import static java.util.Objects.requireNonNull;
  *     filename:  # Also known as "pathname component" or just "component"
  *         "." | ".." | nodot-filename
  *     nodot-filename:
- *         # At least one byte, but none equal to '/' or '\0', and not equal to "." nor "..".
+ *         # Not equal to "." or "..", at least one byte, but none equal to '/' or '\0'.
  * </pre>
  *
  * <p>A pathname can be normalized:  It is guaranteed to resolve to the same file, and simplifies the pathname:</p>
@@ -56,6 +56,8 @@ public class NormalPathnameBuilder {
     private final StringBuilder pathname;
 
     public static NormalPathnameBuilder ofPathname(String pathname) { return ofPathname(pathname, true); }
+
+    /** If the {@code symlinks} parameter is false, then also apply (5) above when normalizing. */
     public static NormalPathnameBuilder ofPathname(String pathname, boolean symlinks) {
         NormalPathnameBuilder builder = new NormalPathnameBuilder(new StringBuilder(), symlinks);
         builder.setFrom(pathname);
@@ -101,6 +103,7 @@ public class NormalPathnameBuilder {
         var parser = new PathnameParser(pathname);
 
         if (parser.skipSlashes()) {
+            this.pathname.append('/');
             parseAbsolute(parser);
         } else {
             parseRelative(parser);
@@ -129,7 +132,7 @@ public class NormalPathnameBuilder {
         switch (parser.lastFilename()) {
             case EOT:
                 // This includes both "" and "/"
-                if (pathname.length() == 0) {
+                if (pathname.isEmpty()) {
                     // parent of "" is ".."
                     pathname.append("..");
                     return this;
@@ -214,21 +217,16 @@ public class NormalPathnameBuilder {
     }
 
     private void parseAbsolute(PathnameParser parser) {
-        pathname.append('/');
-
         while (true) {
             switch (parser.parseFilename()) {
-                case EOT:
-                    return;
-                case DOT:
-                case DOTDOT:
-                    // Skip component
-                    break;
-                case NODOT_FILENAME:
+                case EOT -> { return; }
+                case DOT, DOTDOT -> {} // Skip component
+                case NODOT_FILENAME -> {
                     parser.appendTokenTo(pathname);
                     if (!parser.skipSlashes()) return;
                     parseMultiFilename(parser);
                     return;
+                }
             }
 
             if (!parser.skipSlashes()) return;

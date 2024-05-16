@@ -6,17 +6,17 @@ import static no.ion.utils.io.PathnameParser.FilenameType.DOTDOT;
 import static no.ion.utils.io.PathnameParser.FilenameType.EOT;
 import static no.ion.utils.io.PathnameParser.FilenameType.NODOT_FILENAME;
 
-public class PathnameParser {
+class PathnameParser {
     private final StringApi pathname;
 
     private int index = 0;
     private int start = 0;
 
-    public PathnameParser(String pathname) {
+    PathnameParser(String pathname) {
         this(StringApi.from(requireNonNull(pathname, "pathname cannot be null")));
     }
 
-    public PathnameParser(StringBuilder pathname) {
+    PathnameParser(StringBuilder pathname) {
         this(StringApi.from(requireNonNull(pathname, "pathname cannot be null")));
     }
 
@@ -24,7 +24,7 @@ public class PathnameParser {
         this.pathname = pathname;
     }
 
-    public boolean skipSlashes() {
+    boolean skipSlashes() {
         start = index;
 
         if (!eot() && get() == '/') {
@@ -37,7 +37,7 @@ public class PathnameParser {
         }
     }
 
-    public enum FilenameType {
+    enum FilenameType {
         /** End of text has been reached.  The next token is EOT. */
         EOT,
 
@@ -52,7 +52,7 @@ public class PathnameParser {
     }
 
     /** Returns the next token type. */
-    public FilenameType parseFilename() {
+    FilenameType parseFilename() {
         if (eot()) return EOT;
 
         start = index;
@@ -87,7 +87,7 @@ public class PathnameParser {
      *     <li>NODOT_FILENAME, when pathname ends in a pathname component, which is not "." nor "..".</li>
      * </ul>
      */
-    public FilenameType lastFilename() {
+    FilenameType lastFilename() {
         // This is correct even if there is no "/" in builder.
         start = pathname.lastIndexOf("/") + 1;
         index = pathname.length();
@@ -108,11 +108,11 @@ public class PathnameParser {
         return NODOT_FILENAME;
     }
 
-    public int tokenStartIndex() { return start; }
-    public int tokenEndIndex() { return index; }
-    public int tokenLength() { return index - start; }
+    int tokenStartIndex() { return start; }
+    int tokenEndIndex() { return index; }
+    int tokenLength() { return index - start; }
 
-    public PathnameParser appendTokenTo(StringBuilder builder) {
+    PathnameParser appendTokenTo(StringBuilder builder) {
         builder.append(pathname, start, index);
         return this;
     }
